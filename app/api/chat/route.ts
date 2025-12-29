@@ -1,3 +1,4 @@
+// app/api/chat/route.ts
 export const runtime = "nodejs";
 
 import OpenAI from "openai";
@@ -11,6 +12,10 @@ import { CHARACTERS, type CharacterId } from "../../lib/characters";
  * - 확실하지 않으면 지어내지 말기(진실성 규칙)
  * - "기억": 클라이언트가 보내는 history를 모델 input에 포함
  * - 속도: timeout 짧게 + 재시도 최소 + 출력 토큰 제한
+ *
+ * ✅ 배포에서 fallback처럼 보일 때의 핵심:
+ * - OpenAI 실패를 "숨기지 말고" Runtime Logs에 찍어야 원인(키/모델/툴권한)을 바로 잡을 수 있음.
+ * - web_search 툴이 막히는 환경이면, 자동으로 "툴 없이" 한 번 더 시도하고 그래도 안 되면 fallback.
  */
 
 type ClientMessage = {
@@ -18,12 +23,19 @@ type ClientMessage = {
   text: string;
 };
 
+const ROUTE_VERSION = "2025-12-30-LOGFIX-01";
+
+/** --- 유틸 --- */
 function pick<T>(arr: T[]) {
   return arr[Math.floor(Math.random() * arr.length)];
 }
 
 function getCharacter(characterId: CharacterId) {
   return CHARACTERS.find((c) => c.id === characterId) ?? null;
+}
+
+function isValidCharacterId(x: string): x is CharacterId {
+  return ["cow", "zara", "cat", "goose"].includes(x);
 }
 
 /** --- 텍스트 후처리: 장문/목록 제거 + 짧게 자르기 --- */
@@ -151,28 +163,13 @@ function truthfulnessRules() {
 function characterStyle(characterId: CharacterId) {
   switch (characterId) {
     case "cow":
-      return [
-        "밝고 활발, 친구처럼 텐션 높게.",
-        "2~3문장으로 짧게, 마지막에 질문 1개.",
-        "목록/장문/문서형 설명 금지.",
-      ].join("\n");
+      return ["밝고 활발, 친구처럼 텐션 높게.", "2~3문장으로 짧게, 마지막에 질문 1개.", "목록/장문/문서형 설명 금지."].join("\n");
     case "zara":
-      return [
-        "느긋하고 상냥하게, 부담 덜어주는 톤.",
-        "한 번에 1단계만 제안.",
-        "2~3문장 + 질문 1개.",
-      ].join("\n");
+      return ["느긋하고 상냥하게, 부담 덜어주는 톤.", "한 번에 1단계만 제안.", "2~3문장 + 질문 1개."].join("\n");
     case "cat":
-      return [
-        "완전 귀엽게, 말 끝에 '냥' 붙이기. 가끔 '~하라냥' 섞기.",
-        "짧게, 수다하듯.",
-        "2~3문장 + 질문 1개.",
-      ].join("\n");
+      return ["완전 귀엽게, 말 끝에 '냥' 붙이기. 가끔 '~하라냥' 섞기.", "짧게, 수다하듯.", "2~3문장 + 질문 1개."].join("\n");
     case "goose":
-      return [
-        "공감/위로 중심. 줄마다 '꽉' 붙이기.",
-        "장문 금지. 2~3문장 + 질문 1개.",
-      ].join("\n");
+      return ["공감/위로 중심. 줄마다 '꽉' 붙이기.", "장문 금지. 2~3문장 + 질문 1개."].join("\n");
     default:
       return "짧게 2~3문장 + 질문 1개로 대화형으로 답해.";
   }
@@ -188,29 +185,10 @@ function isShortSearchCommand(msg: string) {
 function needsWebSearch(message: string) {
   const t = message.toLowerCase();
 
-  // ✅ “사용자가 찾아달라/검색”은 무조건 탐색 intent
-  const triggerPhrases = [
-    "검색",
-    "검색해",
-    "검색해줘",
-    "찾아",
-    "찾아줘",
-    "찾아봐",
-    "서치",
-    "네이버",
-    "지도",
-    "구글맵",
-    "근거",
-    "정확",
-    "실제",
-    "진짜",
-    "최신",
-  ];
+  const triggerPhrases = ["검색", "검색해", "검색해줘", "찾아", "찾아줘", "찾아봐", "서치", "네이버", "지도", "구글맵", "근거", "정확", "실제", "진짜", "최신"];
   if (triggerPhrases.some((k) => t.includes(k))) return true;
 
-  // ✅ 객관/현실 정보 키워드(장소/가게/운영/규정/일정/가격 등)
   const factualKeywords = [
-    // 맛집/장소/영업정보
     "맛집",
     "추천",
     "가게",
@@ -245,7 +223,6 @@ function needsWebSearch(message: string) {
     "노선",
     "출구",
     "역",
-    // 학교/행정/시설
     "학교",
     "건국대",
     "건대",
@@ -272,10 +249,7 @@ function needsWebSearch(message: string) {
   ];
   if (factualKeywords.some((k) => t.includes(k))) return true;
 
-  // ✅ 형태 기반 트리거(“~어디/주소/몇시/언제/알려줘/찾아줘”)
-  if (/(어디|어딨어|어딘|위치|주소|영업|운영|몇시|언제|알려줘|찾아줘|검색해)/.test(message)) {
-    return true;
-  }
+  if (/(어디|어딨어|어딘|위치|주소|영업|운영|몇시|언제|알려줘|찾아줘|검색해)/.test(message)) return true;
 
   return false;
 }
@@ -300,13 +274,6 @@ function replyGooseFallback(user: string) {
   const base = `그거 진짜 힘들었겠다\n지금 네 감정이 뭐가 제일 커…? (불안/분노/지침)\n내가 해결이 필요해, 아니면 위로가 필요해…?`;
   return endsWithGgakEveryLine(base);
 }
-
-/** --- OpenAI 설정: 느림 방지 --- */
-const openai = new OpenAI({
-  apiKey: process.env.OPENAI_API_KEY,
-  timeout: 25_000,
-  maxRetries: 0,
-});
 
 /** history 정리(타입/길이/개수 제한) */
 function normalizeHistory(raw: unknown): ClientMessage[] {
@@ -333,8 +300,6 @@ function resolveEffectiveMessage(message: string, history: ClientMessage[]) {
   let effective = message.trim();
   if (!isShortSearchCommand(effective)) return effective;
 
-  // history 끝에는 보통 '찾아'가 이미 들어있으니,
-  // 그 전의 "의미 있는" 사용자 질문을 찾는다.
   for (let i = history.length - 1; i >= 0; i--) {
     const h = history[i];
     if (h.from !== "user") continue;
@@ -356,35 +321,50 @@ function buildConversationInput(history: ClientMessage[], message: string) {
 
   const msg = message.trim();
   const last = history[history.length - 1];
-  const messageIsAlreadyLastUser =
-    last?.from === "user" && typeof last?.text === "string" && last.text.trim() === msg;
+  const messageIsAlreadyLastUser = last?.from === "user" && typeof last?.text === "string" && last.text.trim() === msg;
 
   const merged = messageIsAlreadyLastUser ? history : [...history, { from: "user", text: msg }];
 
   lines.push("[대화 기록]");
-  for (const m of merged) {
-    lines.push(`${m.from === "user" ? "사용자" : "너"}: ${m.text}`);
-  }
+  for (const m of merged) lines.push(`${m.from === "user" ? "사용자" : "너"}: ${m.text}`);
   lines.push("");
-  lines.push(
-    "[지침] 대화 기록을 참고해서 직전 맥락을 이어서 답하고, 사용자가 정정하면 즉시 인정하고 수정해."
-  );
+  lines.push("[지침] 대화 기록을 참고해서 직전 맥락을 이어서 답하고, 사용자가 정정하면 즉시 인정하고 수정해.");
 
   return lines.join("\n");
 }
 
+/** --- 에러 로그 안전 추출(키/내용 유출 금지) --- */
+function summarizeError(e: any) {
+  const status = e?.status ?? e?.response?.status ?? e?.code ?? null;
+  const name = e?.name ?? null;
+  const message = e?.message ?? String(e);
+  // 응답 바디가 있으면 너무 길지 않게
+  const detail = e?.response?.data ? JSON.stringify(e.response.data).slice(0, 600) : null;
+  return { status, name, message, detail };
+}
+
+/** --- OpenAI 클라이언트(키 있을 때만 생성) --- */
+function getOpenAIClient() {
+  const apiKey = process.env.OPENAI_API_KEY;
+  if (!apiKey) return null;
+
+  return new OpenAI({
+    apiKey,
+    timeout: 25_000,
+    maxRetries: 0,
+  });
+}
+
 async function replyWithOpenAI(characterId: CharacterId, userMessage: string, history: ClientMessage[]) {
-  if (!process.env.OPENAI_API_KEY) throw new Error("OPENAI_API_KEY is missing");
+  const client = getOpenAIClient();
+  if (!client) throw new Error("OPENAI_API_KEY is missing");
 
   const character = getCharacter(characterId);
   if (!character) throw new Error("Invalid characterId");
 
-  const model = process.env.OPENAI_MODEL || "gpt-4.1-mini";
+  const model = (process.env.OPENAI_MODEL || "gpt-4.1-mini").trim();
 
-  // ✅ 실제로 모델에 들어가는 메시지(찾아/검색 보정 포함)
   const effectiveMessage = resolveEffectiveMessage(userMessage, history);
-
-  // ✅ web_search 조건은 effectiveMessage 기준으로 판단 (중요)
   const enableWebSearch = needsWebSearch(effectiveMessage);
 
   const instructions =
@@ -405,61 +385,106 @@ async function replyWithOpenAI(characterId: CharacterId, userMessage: string, hi
 
   const input = buildConversationInput(history, effectiveMessage);
 
-  const resp = await openai.responses.create({
-    model,
-    instructions,
-    input,
-    max_output_tokens: 240,
-    store: false,
-    tools: enableWebSearch ? [{ type: "web_search" as const }] : undefined,
-  });
+  // 1) web_search 켠 요청
+  try {
+    const resp = await client.responses.create({
+      model,
+      instructions,
+      input,
+      max_output_tokens: 240,
+      store: false,
+      tools: enableWebSearch ? [{ type: "web_search" as const }] : undefined,
+    });
 
-  const raw = resp.output_text ?? "";
-  if (!raw.trim()) throw new Error("Empty model output");
+    const raw = resp.output_text ?? "";
+    if (!raw.trim()) throw new Error("Empty model output");
 
-  const reply = postProcess(characterId, raw);
-  return { reply, sources: [], used_web_search: enableWebSearch };
+    const reply = postProcess(characterId, raw);
+    return { reply, sources: [], used_web_search: enableWebSearch };
+  } catch (e: any) {
+    // 2) web_search가 문제일 수 있으니, enableWebSearch=true였을 때만 "툴 없이" 1번 더 시도
+    if (enableWebSearch) {
+      const se = summarizeError(e);
+      console.error("[OpenAI] failed WITH web_search, retry WITHOUT tools:", se);
+
+      const resp2 = await client.responses.create({
+        model,
+        instructions,
+        input,
+        max_output_tokens: 240,
+        store: false,
+        tools: undefined,
+      });
+
+      const raw2 = resp2.output_text ?? "";
+      if (!raw2.trim()) throw new Error("Empty model output (retry)");
+
+      const reply2 = postProcess(characterId, raw2);
+      return { reply: reply2, sources: [], used_web_search: false };
+    }
+
+    // enableWebSearch=false였으면 그냥 던져서 상위에서 fallback 처리
+    throw e;
+  }
 }
 
 export async function POST(req: Request) {
+  console.log("ROUTE_VERSION=", ROUTE_VERSION);
+
   try {
     const body = await req.json();
     const message = String(body?.message ?? "").trim();
-    const characterId = String(body?.characterId ?? "") as CharacterId;
-
-    // ✅ ChatClient에서 보내는 history 받기
+    const rawCharacterId = String(body?.characterId ?? "").trim();
     const history = normalizeHistory(body?.history);
 
     if (!message) {
-      return Response.json({
-        reply: "음… 메시지가 비어있어 😵‍💫",
-        sources: [],
-        used_web_search: false,
-        used_fallback: true,
-      });
+      return Response.json(
+        { reply: "음… 메시지가 비어있어 😵‍💫", sources: [], used_web_search: false, used_fallback: true },
+        { status: 200 }
+      );
     }
+
+    if (!isValidCharacterId(rawCharacterId)) {
+      return Response.json(
+        { reply: "앗… 캐릭터 id가 이상해 😵‍💫 (cow/zara/cat/goose 중 하나여야 해!)", sources: [], used_web_search: false, used_fallback: true },
+        { status: 200 }
+      );
+    }
+    const characterId = rawCharacterId as CharacterId;
 
     // “꽉 빼” 같은 사용자의 명시적 요청은 최우선 반영
     if (characterId === "goose" && (message.includes("꽉 빼") || message.includes("꽉하지마"))) {
-      return Response.json({
-        reply: "알겠어… 오늘은 ‘꽉’ 없이 말할게 🫂",
-        sources: [],
-        used_web_search: false,
-        used_fallback: true,
-      });
+      return Response.json(
+        { reply: "알겠어… 오늘은 ‘꽉’ 없이 말할게 🫂", sources: [], used_web_search: false, used_fallback: true },
+        { status: 200 }
+      );
     }
 
-    // OpenAI 시도
+    // ✅ 배포 디버그용: 내용 유출 없이 "상태"만 로깅
+    const effectiveMessage = resolveEffectiveMessage(message, history);
+    const enableWebSearch = needsWebSearch(effectiveMessage);
+    console.log("[REQ]", {
+      hasKey: Boolean(process.env.OPENAI_API_KEY),
+      model: (process.env.OPENAI_MODEL || "gpt-4.1-mini").trim(),
+      characterId,
+      msgLen: message.length,
+      historyLen: history.length,
+      enableWebSearch,
+    });
+
+    // OpenAI 시도 (실패 원인을 반드시 로그로 남김)
     if (process.env.OPENAI_API_KEY) {
       try {
         const r = await replyWithOpenAI(characterId, message, history);
-        return Response.json({ ...r, used_fallback: false });
+        return Response.json({ ...r, used_fallback: false }, { status: 200 });
       } catch (e: any) {
-        // console.error("OpenAI failed:", e?.message);
+        console.error("[OpenAI] failed:", summarizeError(e));
       }
+    } else {
+      console.warn("[OpenAI] missing OPENAI_API_KEY -> fallback");
     }
 
-    // fallback(키 없거나 실패)
+    // fallback
     let reply = "";
     switch (characterId) {
       case "cow":
@@ -472,8 +497,6 @@ export async function POST(req: Request) {
         reply = replyCatFallback();
         break;
       case "goose":
-        // ✅ 여기서도 effectiveMessage 쓰면 자연스러운데,
-        // fallback은 검색이 안 되니 원문 유지해도 됨. 그래도 '찾아'면 이전 질문을 잡아주게 처리:
         reply = replyGooseFallback(resolveEffectiveMessage(message, history));
         break;
       default:
@@ -481,8 +504,9 @@ export async function POST(req: Request) {
         break;
     }
 
-    return Response.json({ reply, sources: [], used_web_search: false, used_fallback: true });
+    return Response.json({ reply, sources: [], used_web_search: false, used_fallback: true }, { status: 200 });
   } catch (e: any) {
+    console.error("[POST] handler error:", summarizeError(e));
     return Response.json({ error: e?.message ?? "unknown error" }, { status: 500 });
   }
 }
